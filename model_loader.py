@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from transformers import GPT2Tokenizer
 import os
 import sys
+from huggingface_hub import hf_hub_download
 
 # === GPTConfig ===
 @dataclass
@@ -113,11 +114,41 @@ class GPT(nn.Module):
 # Make GPTConfig available to the pickle loader
 sys.modules['__main__'].GPTConfig = GPTConfig
 
+
+# Map model_name from request to Hugging Face repo ID
+HF_REPO_MAP = {
+    "gouda0.0.1": "Erbium08/gouda0.0.1",
+    # Add more here if needed:
+    # "cheddar1.0": "Erbium08/cheddar1.0"
+}
+
+def download_model(model_name):
+    if model_name not in HF_REPO_MAP:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    repo_id = HF_REPO_MAP[model_name]
+
+    # Create local cache directory
+    model_dir = f"models/{model_name}"
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Download model.pt from Hugging Face Hub
+    model_path = hf_hub_download(
+        repo_id=repo_id,
+        filename="model.pt",
+        cache_dir=model_dir,
+        local_dir=model_dir,
+        force_filename="model.pt"
+    )
+
+    return model_path
+
+
 # === Load model + tokenizer ===
 model_cache = {}
 
 def load_model(model_name):
-    model_dir = f"models/{model_name}"
+    model_path = download_model(model_name)
     
     try:
         # Try to add GPTConfig to safe globals (for newer PyTorch)
@@ -129,10 +160,10 @@ def load_model(model_name):
     
     # Load checkpoint with weights_only=False
     try:
-        checkpoint = torch.load(os.path.join(model_dir, "model.pt"), map_location="cpu", weights_only=False)
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
     except TypeError:
         # Fallback for older PyTorch versions
-        checkpoint = torch.load(os.path.join(model_dir, "model.pt"), map_location="cpu")
+        checkpoint = torch.load(model_path, map_location="cpu")
     
     config = checkpoint["config"]
     model = GPT(config)
