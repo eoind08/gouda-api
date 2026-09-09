@@ -66,7 +66,6 @@ class GPTConfig:
 
 
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, config: GPTConfig):
         super().__init__()
 
@@ -74,6 +73,7 @@ class CausalSelfAttention(nn.Module):
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
 
         self.c_attn = nn.Linear(
             config.n_embd,
@@ -100,8 +100,7 @@ class CausalSelfAttention(nn.Module):
             )
         )
 
-    def forward(self, x):
-
+    def forward(self, x, past_kv=None, use_cache=False):
         B, T, C = x.size()
 
         q, k, v = self.c_attn(x).split(
@@ -109,36 +108,57 @@ class CausalSelfAttention(nn.Module):
             dim=2
         )
 
-        head_dim = C // self.n_head
-
         q = q.view(
             B,
             T,
             self.n_head,
-            head_dim
+            self.head_dim
         ).transpose(1, 2)
 
         k = k.view(
             B,
             T,
             self.n_head,
-            head_dim
+            self.head_dim
         ).transpose(1, 2)
 
         v = v.view(
             B,
             T,
             self.n_head,
-            head_dim
+            self.head_dim
         ).transpose(1, 2)
 
-        # Fast PyTorch attention implementation
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=True
-        )
+        # Add cached keys/values from previous tokens
+        if past_kv is not None:
+            past_k, past_v = past_kv
+
+            k = torch.cat(
+                [past_k, k],
+                dim=2
+            )
+
+            v = torch.cat(
+                [past_v, v],
+                dim=2
+            )
+
+        # If we have a cache, causality is already guaranteed:
+        # the cached K/V only contain previous tokens.
+        if past_kv is not None:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=False
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True
+            )
 
         y = (
             y.transpose(1, 2)
@@ -148,7 +168,9 @@ class CausalSelfAttention(nn.Module):
 
         y = self.c_proj(y)
 
-        return y
+        new_kv = (k, v) if use_cache else None
+
+        return y, new_kv
 
 
 class MLP(nn.Module):
@@ -198,17 +220,21 @@ class Block(nn.Module):
             config
         )
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None, use_cache=False):
 
-        x = x + self.attn(
-            self.ln_1(x)
+        attn_output, new_kv = self.attn(
+            self.ln_1(x),
+            past_kv=past_kv,
+            use_cache=use_cache,
         )
+
+        x = x + attn_output
 
         x = x + self.mlp(
             self.ln_2(x)
         )
 
-        return x
+        return x, new_kv
 
 
 
@@ -280,23 +306,30 @@ class GPT(nn.Module):
                 std=0.02
             )
 
-    def forward(self, idx):
-
+    def forward(
+        self,
+        idx,
+        past_key_values=None,
+        use_cache=False,
+    ):
         B, T = idx.size()
 
-        if T > self.config.block_size:
+        if past_key_values is None:
+            past_length = 0
+        else:
+            past_length = past_key_values[0][0].size(2)
 
+        if past_length + T > self.config.block_size:
             raise ValueError(
-                f"Sequence length {T} exceeds "
-                f"model context length "
-                f"{self.config.block_size}"
+                f"Sequence length {past_length + T} exceeds "
+                f"model context length {self.config.block_size}"
             )
 
         pos = torch.arange(
-            0,
-            T,
+            past_length,
+            past_length + T,
             dtype=torch.long,
-            device=idx.device
+            device=idx.device,
         )
 
         tok_emb = self.transformer.wte(idx)
@@ -305,13 +338,32 @@ class GPT(nn.Module):
 
         x = tok_emb + pos_emb
 
-        for block in self.transformer.h:
+        new_key_values = []
 
-            x = block(x)
+        for layer_idx, block in enumerate(
+            self.transformer.h
+        ):
+            past_kv = (
+                past_key_values[layer_idx]
+                if past_key_values is not None
+                else None
+            )
+
+            x, new_kv = block(
+                x,
+                past_kv=past_kv,
+                use_cache=use_cache,
+            )
+
+            if use_cache:
+                new_key_values.append(new_kv)
 
         x = self.transformer.ln_f(x)
 
         logits = self.lm_head(x)
+
+        if use_cache:
+            return logits, new_key_values
 
         return logits
 
@@ -323,28 +375,23 @@ class GPT(nn.Module):
         temperature=0.7,
         top_k=40,
     ):
+        # Initial forward pass.
+        # This processes the entire prompt once and builds the KV cache.
+        logits, past_key_values = self(
+            idx,
+            use_cache=True,
+        )
+
+        generated = []
 
         for _ in range(max_new_tokens):
-
-            idx_cond = idx[
-                :,
-                -self.config.block_size:
-            ]
-
-            logits = self(
-                idx_cond
-            )
 
             logits = logits[:, -1, :]
 
             if temperature != 1.0:
-
-                logits = (
-                    logits / temperature
-                )
+                logits = logits / temperature
 
             if top_k is not None:
-
                 v, _ = torch.topk(
                     logits,
                     min(
@@ -367,12 +414,87 @@ class GPT(nn.Module):
                 num_samples=1
             )
 
-            idx = torch.cat(
-                (idx, next_token),
+            generated.append(next_token)
+
+            # Only send the newly generated token
+            # through the model.
+            logits, past_key_values = self(
+                next_token,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+
+        if generated:
+            generated = torch.cat(
+                generated,
+                dim=1
+            )
+
+            return torch.cat(
+                [idx, generated],
                 dim=1
             )
 
         return idx
+
+    @torch.inference_mode()
+    def generate_stream(
+        self,
+        idx,
+        max_new_tokens=256,
+        temperature=0.7,
+        top_k=40,
+    ):
+        # Initial prompt pass
+        logits, past_key_values = self(
+            idx,
+            use_cache=True,
+        )
+
+        generated_ids = []
+
+        for _ in range(max_new_tokens):
+
+            logits = logits[:, -1, :]
+
+            if temperature != 1.0:
+                logits = logits / temperature
+
+            if top_k is not None:
+                v, _ = torch.topk(
+                    logits,
+                    min(
+                        top_k,
+                        logits.size(-1)
+                    )
+                )
+
+                logits[
+                    logits < v[:, [-1]]
+                ] = float("-inf")
+
+            probs = F.softmax(
+                logits,
+                dim=-1
+            )
+
+            next_token = torch.multinomial(
+                probs,
+                num_samples=1
+            )
+
+            generated_ids.append(
+                next_token.item()
+            )
+
+            yield next_token.item()
+
+            # Process only the new token
+            logits, past_key_values = self(
+                next_token,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
 
 
 
@@ -791,3 +913,43 @@ def generate_response(
     )
 
     return response.strip()
+
+def generate_response_stream(
+    model,
+    message: str,
+    max_tokens: int = 256,
+    temperature: float = 0.7,
+    top_k: int = 40,
+):
+    tokenizer = get_tokenizer()
+
+    input_ids = tokenizer.encode(
+        message,
+        return_tensors="pt"
+    ).to(DEVICE)
+
+    generated_ids = []
+
+    previous_text = ""
+
+    for token_id in model.generate_stream(
+        input_ids,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        top_k=top_k,
+    ):
+        generated_ids.append(token_id)
+
+        current_text = tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True
+        )
+
+        new_text = current_text[
+            len(previous_text):
+        ]
+
+        previous_text = current_text
+
+        if new_text:
+            yield new_text

@@ -1,9 +1,11 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from model_loader import (
     get_model,
     generate_response,
+    generate_response_stream,
     is_model_available,
     list_models,
 )
@@ -109,6 +111,70 @@ def chat(request: MessageRequest):
 
         print(
             f"[ERROR] Generation failed "
+            f"for {model_name}: {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Model generation failed.",
+        )
+
+@app.post("/chat/stream")
+def chat_stream(request: MessageRequest):
+
+    model_name = request.model_name.strip()
+
+    if not model_name:
+        raise HTTPException(
+            status_code=400,
+            detail="model_name cannot be empty",
+        )
+
+    if not is_model_available(model_name):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "Unknown model",
+                "model": model_name,
+                "available_models": list_models(),
+            },
+        )
+
+    if not request.message.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="message cannot be empty",
+        )
+
+    if not 1 <= request.max_tokens <= 256:
+        raise HTTPException(
+            status_code=400,
+            detail="max_tokens must be between 1 and 256",
+        )
+
+    try:
+        model = get_model(model_name)
+
+        return StreamingResponse(
+            generate_response_stream(
+                model=model,
+                message=request.message,
+                max_tokens=request.max_tokens,
+            ),
+            media_type="text/plain",
+        )
+
+    except ValueError as e:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )
+
+    except Exception as e:
+
+        print(
+            f"[ERROR] Streaming generation failed "
             f"for {model_name}: {e}"
         )
 
