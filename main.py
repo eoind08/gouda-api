@@ -3,7 +3,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from model_loader import (
-    get_model,
     generate_response,
     generate_response_stream,
     is_model_available,
@@ -13,23 +12,26 @@ from model_loader import (
 
 app = FastAPI(
     title="Gouda API",
-    version="1.0.0",
+    version="1.3.0",
 )
 
 
-# ============================================================
-# Request / Response models
-# ============================================================
-
 class MessageRequest(BaseModel):
-    model_name: str
+    model_name: str = "Gruyere-1.1"
     message: str
+
     max_tokens: int = 100
+    temperature: float = 0.7
+    top_p: float = 1.0
+    top_k: int = 40
 
+    repetition_penalty: float = 1.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
 
-# ============================================================
-# Health check
-# ============================================================
+    seed: int | None = None
+    stop: list[str] | None = None
+
 
 @app.get("/")
 def root():
@@ -45,10 +47,6 @@ def health():
         "status": "ok",
     }
 
-
-# ============================================================
-# Chat
-# ============================================================
 
 @app.post("/chat")
 def chat(request: MessageRequest):
@@ -83,32 +81,58 @@ def chat(request: MessageRequest):
             detail="max_tokens must be between 1 and 256",
         )
 
-    try:
-
-        model = get_model(
-            model_name
+    if not 0 <= request.temperature <= 2:
+        raise HTTPException(
+            status_code=400,
+            detail="temperature must be between 0 and 2",
         )
 
-        response = generate_response(
-            model=model,
+    if not 0 < request.top_p <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="top_p must be greater than 0 and at most 1",
+        )
+
+    if request.top_k < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="top_k cannot be negative",
+        )
+
+    if request.repetition_penalty <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="repetition_penalty must be greater than 0",
+        )
+
+    try:
+        result = generate_response(
+            model_name=model_name,
             message=request.message,
             max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
+            repetition_penalty=request.repetition_penalty,
+            frequency_penalty=request.frequency_penalty,
+            presence_penalty=request.presence_penalty,
+            seed=request.seed,
+            stop=request.stop,
         )
 
         return {
-            "response": response,
+            "response": result["text"],
             "model": model_name,
+            "usage": result["usage"],
         }
 
     except ValueError as e:
-
         raise HTTPException(
             status_code=400,
             detail=str(e),
         )
 
     except Exception as e:
-
         print(
             f"[ERROR] Generation failed "
             f"for {model_name}: {e}"
@@ -118,6 +142,7 @@ def chat(request: MessageRequest):
             status_code=500,
             detail="Model generation failed.",
         )
+
 
 @app.post("/chat/stream")
 def chat_stream(request: MessageRequest):
@@ -152,27 +177,55 @@ def chat_stream(request: MessageRequest):
             detail="max_tokens must be between 1 and 256",
         )
 
-    try:
-        model = get_model(model_name)
+    if not 0 <= request.temperature <= 2:
+        raise HTTPException(
+            status_code=400,
+            detail="temperature must be between 0 and 2",
+        )
 
+    if not 0 < request.top_p <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="top_p must be greater than 0 and at most 1",
+        )
+
+    if request.top_k < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="top_k cannot be negative",
+        )
+
+    if request.repetition_penalty <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="repetition_penalty must be greater than 0",
+        )
+
+    try:
         return StreamingResponse(
             generate_response_stream(
-                model=model,
+                model_name=model_name,
                 message=request.message,
                 max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                repetition_penalty=request.repetition_penalty,
+                frequency_penalty=request.frequency_penalty,
+                presence_penalty=request.presence_penalty,
+                seed=request.seed,
+                stop=request.stop,
             ),
             media_type="text/plain",
         )
 
     except ValueError as e:
-
         raise HTTPException(
             status_code=400,
             detail=str(e),
         )
 
     except Exception as e:
-
         print(
             f"[ERROR] Streaming generation failed "
             f"for {model_name}: {e}"

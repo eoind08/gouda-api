@@ -1,955 +1,433 @@
-# model_loader.py
-
-import os
-import sys
 import threading
-from dataclasses import dataclass
-from typing import Any
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from huggingface_hub import hf_hub_download
-from transformers import GPT2Tokenizer
-
-
-# ============================================================
-# DEVICE
-# ============================================================
-
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TextIteratorStreamer,
+    LogitsProcessor,
+    LogitsProcessorList,
 )
 
-USE_HALF = False
-
 
 # ============================================================
-# MODEL REGISTRY
+# Model registry
 # ============================================================
 
-MODEL_REGISTRY = {
-    "gouda0.0.1": {
-        "repo_id": "Erbium08/gouda0.0.1",
-        "filename": "model.pt",
-    },
-
-    "gouda-g1-xs-r2": {
-        "repo_id": "Erbium08/gouda-g1-xs-r2",
-        "filename": "model.pt",
-    },
-
-    "gouda-g1-xs-r4": {
-        "repo_id": "Erbium08/gouda-g1-xs-r4",
-        "filename": "model_10000.pt",
-    },
-
-    "gouda-g1-s-r1": {
-            "repo_id": "Erbium08/gouda-g1-s-r1",
-            "filename": "model_30517_50m.pt",
-    },
-
-    "Gruyere-1.0-r1": {
-        "repo_id": "Erbium08/Gruyere-1.0-r1",
-        "filename": "model_19999.pt",
-    }
+MODELS = {
+    "Gruyere-1.1": "Erbium08/Gruyere-1.1",
+    # "Gruyere-1.2": "Erbium08/Gruyere-1.2",
+    # "Ricotta-1.0": "Erbium08/Ricotta-1.0",
 }
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 8
-    n_embd: int = 512
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-
-        assert config.n_embd % config.n_head == 0
-
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_dim = config.n_embd // config.n_head
-
-        self.c_attn = nn.Linear(
-            config.n_embd,
-            3 * config.n_embd
-        )
-
-        self.c_proj = nn.Linear(
-            config.n_embd,
-            config.n_embd
-        )
-
-        self.register_buffer(
-            "bias",
-            torch.tril(
-                torch.ones(
-                    config.block_size,
-                    config.block_size
-                )
-            ).view(
-                1,
-                1,
-                config.block_size,
-                config.block_size
-            )
-        )
-
-    def forward(self, x, past_kv=None, use_cache=False):
-        B, T, C = x.size()
-
-        q, k, v = self.c_attn(x).split(
-            self.n_embd,
-            dim=2
-        )
-
-        q = q.view(
-            B,
-            T,
-            self.n_head,
-            self.head_dim
-        ).transpose(1, 2)
-
-        k = k.view(
-            B,
-            T,
-            self.n_head,
-            self.head_dim
-        ).transpose(1, 2)
-
-        v = v.view(
-            B,
-            T,
-            self.n_head,
-            self.head_dim
-        ).transpose(1, 2)
-
-        # Add cached keys/values from previous tokens
-        if past_kv is not None:
-            past_k, past_v = past_kv
-
-            k = torch.cat(
-                [past_k, k],
-                dim=2
-            )
-
-            v = torch.cat(
-                [past_v, v],
-                dim=2
-            )
-
-        # If we have a cache, causality is already guaranteed:
-        # the cached K/V only contain previous tokens.
-        if past_kv is not None:
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                is_causal=False
-            )
-        else:
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                is_causal=True
-            )
 
-        y = (
-            y.transpose(1, 2)
-             .contiguous()
-             .view(B, T, C)
-        )
+# ============================================================
+# Runtime configuration
+# ============================================================
 
-        y = self.c_proj(y)
+DEVICE = torch.device("cpu")
+DTYPE = torch.float32
 
-        new_kv = (k, v) if use_cache else None
+_models = {}
+_tokenizers = {}
+_load_locks = {}
 
-        return y, new_kv
 
+# ============================================================
+# Custom logits processors
+# ============================================================
 
-class MLP(nn.Module):
+class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
 
-    def __init__(self, config: GPTConfig):
-        super().__init__()
+    def __init__(self, penalty: float):
+        self.penalty = penalty
 
-        self.c_fc = nn.Linear(
-            config.n_embd,
-            4 * config.n_embd
-        )
+    def __call__(self, input_ids, scores):
+        if self.penalty == 0:
+            return scores
 
-        self.gelu = nn.GELU()
+        for batch_idx in range(input_ids.shape[0]):
+            token_counts = torch.bincount(
+                input_ids[batch_idx],
+                minlength=scores.shape[-1],
+            ).to(scores.device)
 
-        self.c_proj = nn.Linear(
-            4 * config.n_embd,
-            config.n_embd
-        )
+            scores[batch_idx] -= self.penalty * token_counts
 
-    def forward(self, x):
+        return scores
 
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
 
-        return x
+class PresencePenaltyLogitsProcessor(LogitsProcessor):
 
+    def __init__(self, penalty: float):
+        self.penalty = penalty
 
-class Block(nn.Module):
+    def __call__(self, input_ids, scores):
+        if self.penalty == 0:
+            return scores
 
-    def __init__(self, config: GPTConfig):
-        super().__init__()
+        for batch_idx in range(input_ids.shape[0]):
+            unique_tokens = torch.unique(input_ids[batch_idx])
 
-        self.ln_1 = nn.LayerNorm(
-            config.n_embd
-        )
+            scores[batch_idx, unique_tokens] -= self.penalty
 
-        self.attn = CausalSelfAttention(
-            config
-        )
+        return scores
 
-        self.ln_2 = nn.LayerNorm(
-            config.n_embd
-        )
 
-        self.mlp = MLP(
-            config
-        )
+# ============================================================
+# Model loading
+# ============================================================
 
-    def forward(self, x, past_kv=None, use_cache=False):
+def load_model(model_name: str):
 
-        attn_output, new_kv = self.attn(
-            self.ln_1(x),
-            past_kv=past_kv,
-            use_cache=use_cache,
-        )
+    if model_name not in MODELS:
+        raise ValueError(f"Unknown model: {model_name}")
 
-        x = x + attn_output
+    if model_name in _models:
+        return _models[model_name], _tokenizers[model_name]
 
-        x = x + self.mlp(
-            self.ln_2(x)
-        )
-
-        return x, new_kv
-
-
-
-class GPT(nn.Module):
-
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-
-        self.config = config
-
-        self.transformer = nn.ModuleDict({
-
-            "wte": nn.Embedding(
-                config.vocab_size,
-                config.n_embd
-            ),
-
-            "wpe": nn.Embedding(
-                config.block_size,
-                config.n_embd
-            ),
-
-            "h": nn.ModuleList([
-                Block(config)
-                for _ in range(config.n_layer)
-            ]),
-
-            "ln_f": nn.LayerNorm(
-                config.n_embd
-            ),
-        })
-
-        self.lm_head = nn.Linear(
-            config.n_embd,
-            config.vocab_size,
-            bias=False
-        )
-
-        # Weight tying
-        self.transformer.wte.weight = (
-            self.lm_head.weight
-        )
-
-        self.apply(
-            self._init_weights
-        )
-
-    @staticmethod
-    def _init_weights(module):
-
-        if isinstance(module, nn.Linear):
-
-            torch.nn.init.normal_(
-                module.weight,
-                mean=0.0,
-                std=0.02
-            )
-
-            if module.bias is not None:
-                torch.nn.init.zeros_(
-                    module.bias
-                )
-
-        elif isinstance(module, nn.Embedding):
-
-            torch.nn.init.normal_(
-                module.weight,
-                mean=0.0,
-                std=0.02
-            )
-
-    def forward(
-        self,
-        idx,
-        past_key_values=None,
-        use_cache=False,
-    ):
-        B, T = idx.size()
-
-        if past_key_values is None:
-            past_length = 0
-        else:
-            past_length = past_key_values[0][0].size(2)
-
-        if past_length + T > self.config.block_size:
-            raise ValueError(
-                f"Sequence length {past_length + T} exceeds "
-                f"model context length {self.config.block_size}"
-            )
-
-        pos = torch.arange(
-            past_length,
-            past_length + T,
-            dtype=torch.long,
-            device=idx.device,
-        )
-
-        tok_emb = self.transformer.wte(idx)
-
-        pos_emb = self.transformer.wpe(pos)
-
-        x = tok_emb + pos_emb
-
-        new_key_values = []
-
-        for layer_idx, block in enumerate(
-            self.transformer.h
-        ):
-            past_kv = (
-                past_key_values[layer_idx]
-                if past_key_values is not None
-                else None
-            )
-
-            x, new_kv = block(
-                x,
-                past_kv=past_kv,
-                use_cache=use_cache,
-            )
-
-            if use_cache:
-                new_key_values.append(new_kv)
-
-        x = self.transformer.ln_f(x)
-
-        logits = self.lm_head(x)
-
-        if use_cache:
-            return logits, new_key_values
-
-        return logits
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        idx,
-        max_new_tokens=256,
-        temperature=0.7,
-        top_k=40,
-    ):
-        # Initial forward pass.
-        # This processes the entire prompt once and builds the KV cache.
-        logits, past_key_values = self(
-            idx,
-            use_cache=True,
-        )
-
-        generated = []
-
-        for _ in range(max_new_tokens):
-
-            logits = logits[:, -1, :]
-
-            if temperature != 1.0:
-                logits = logits / temperature
-
-            if top_k is not None:
-                v, _ = torch.topk(
-                    logits,
-                    min(
-                        top_k,
-                        logits.size(-1)
-                    )
-                )
-
-                logits[
-                    logits < v[:, [-1]]
-                ] = float("-inf")
-
-            probs = F.softmax(
-                logits,
-                dim=-1
-            )
-
-            next_token = torch.multinomial(
-                probs,
-                num_samples=1
-            )
-
-            generated.append(next_token)
-
-            # Only send the newly generated token
-            # through the model.
-            logits, past_key_values = self(
-                next_token,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-
-        if generated:
-            generated = torch.cat(
-                generated,
-                dim=1
-            )
-
-            return torch.cat(
-                [idx, generated],
-                dim=1
-            )
-
-        return idx
-
-    @torch.inference_mode()
-    def generate_stream(
-        self,
-        idx,
-        max_new_tokens=256,
-        temperature=0.7,
-        top_k=40,
-    ):
-        # Initial prompt pass
-        logits, past_key_values = self(
-            idx,
-            use_cache=True,
-        )
-
-        generated_ids = []
-
-        for _ in range(max_new_tokens):
-
-            logits = logits[:, -1, :]
-
-            if temperature != 1.0:
-                logits = logits / temperature
-
-            if top_k is not None:
-                v, _ = torch.topk(
-                    logits,
-                    min(
-                        top_k,
-                        logits.size(-1)
-                    )
-                )
-
-                logits[
-                    logits < v[:, [-1]]
-                ] = float("-inf")
-
-            probs = F.softmax(
-                logits,
-                dim=-1
-            )
-
-            next_token = torch.multinomial(
-                probs,
-                num_samples=1
-            )
-
-            generated_ids.append(
-                next_token.item()
-            )
-
-            yield next_token.item()
-
-            # Process only the new token
-            logits, past_key_values = self(
-                next_token,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-
-
-
-sys.modules["__main__"].GPTConfig = GPTConfig
-
-
-_tokenizer = None
-_tokenizer_lock = threading.Lock()
-
-
-def get_tokenizer():
-
-    global _tokenizer
-
-    if _tokenizer is None:
-
-        with _tokenizer_lock:
-
-            if _tokenizer is None:
-
-                print(
-                    "[MODEL] Loading GPT-2 tokenizer..."
-                )
-
-                _tokenizer = (
-                    GPT2Tokenizer.from_pretrained(
-                        "gpt2"
-                    )
-                )
-
-                print(
-                    "[MODEL] Tokenizer loaded."
-                )
-
-    return _tokenizer
-
-
-
-model_cache = {}
-
-_model_lock = threading.Lock()
-
-
-def list_models() -> list[str]:
-
-    return list(
-        MODEL_REGISTRY.keys()
+    lock = _load_locks.setdefault(
+        model_name,
+        threading.Lock(),
     )
 
+    with lock:
 
+        if model_name in _models:
+            return _models[model_name], _tokenizers[model_name]
 
-def is_model_available(
-    model_name: str
-) -> bool:
-
-    # IMPORTANT:
-    # This checks whether the model is registered,
-    # NOT whether it has already been downloaded.
-
-    return model_name in MODEL_REGISTRY
-
-
-def download_model(
-    model_name: str
-) -> str:
-
-    if not is_model_available(
-        model_name
-    ):
-
-        raise ValueError(
-            f"Unknown model: {model_name}. "
-            f"Available models: "
-            f"{list_models()}"
-        )
-
-    info = MODEL_REGISTRY[
-        model_name
-    ]
-
-    repo_id = info["repo_id"]
-
-    filename = info["filename"]
-
-    model_dir = os.path.join(
-        "models",
-        model_name
-    )
-
-    os.makedirs(
-        model_dir,
-        exist_ok=True
-    )
-
-    local_path = os.path.join(
-        model_dir,
-        filename
-    )
-
-
-    if os.path.isfile(
-        local_path
-    ):
+        repo_id = MODELS[model_name]
 
         print(
-            f"[MODEL] Using local checkpoint: "
-            f"{local_path}"
+            f"[MODEL] Loading {model_name} "
+            f"from {repo_id}..."
         )
 
-        return local_path
-
-
-    print(
-        f"[MODEL] Downloading {model_name} "
-        f"from {repo_id}..."
-    )
-
-    path = hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        local_dir=model_dir,
-    )
-
-    print(
-        f"[MODEL] Download complete: {path}"
-    )
-
-    return path
-
-
-
-def normalize_config(
-    raw_config: Any
-) -> GPTConfig:
-
-    if isinstance(
-        raw_config,
-        GPTConfig
-    ):
-
-        return raw_config
-
-    if isinstance(
-        raw_config,
-        dict
-    ):
-
-        return GPTConfig(
-            block_size=raw_config.get(
-                "block_size",
-                1024
-            ),
-
-            vocab_size=raw_config.get(
-                "vocab_size",
-                50257
-            ),
-
-            n_layer=raw_config.get(
-                "n_layer",
-                12
-            ),
-
-            n_head=raw_config.get(
-                "n_head",
-                8
-            ),
-
-            n_embd=raw_config.get(
-                "n_embd",
-                512
-            ),
+        tokenizer = AutoTokenizer.from_pretrained(
+            repo_id,
+            trust_remote_code=True,
         )
 
-    required = [
-        "block_size",
-        "vocab_size",
-        "n_layer",
-        "n_head",
-        "n_embd",
-    ]
-
-    if all(
-        hasattr(
-            raw_config,
-            key
-        )
-        for key in required
-    ):
-
-        return GPTConfig(
-            block_size=raw_config.block_size,
-            vocab_size=raw_config.vocab_size,
-            n_layer=raw_config.n_layer,
-            n_head=raw_config.n_head,
-            n_embd=raw_config.n_embd,
+        model = AutoModelForCausalLM.from_pretrained(
+            repo_id,
+            trust_remote_code=True,
+            torch_dtype=DTYPE,
         )
 
-    raise TypeError(
-        "Unable to interpret model config "
-        f"of type {type(raw_config)}"
-    )
+        model.to(DEVICE)
+        model.eval()
 
+        _models[model_name] = model
+        _tokenizers[model_name] = tokenizer
 
-def load_model(
-    model_name: str
-):
-
-    checkpoint_path = download_model(
-        model_name
-    )
-
-    print(
-        f"[MODEL] Loading checkpoint: "
-        f"{checkpoint_path}"
-    )
-
-    # Legacy checkpoints use pickle and therefore require
-    # weights_only=False.
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=False,
-    )
-
-
-    if (
-        isinstance(checkpoint, dict)
-        and "config" in checkpoint
-    ):
-
-        config = normalize_config(
-            checkpoint["config"]
+        print(
+            f"[MODEL] {model_name} loaded "
+            f"on {DEVICE}"
         )
 
-    else:
-
-        raise RuntimeError(
-            f"Checkpoint for '{model_name}' "
-            "does not contain a recognised "
-            "'config'."
-        )
-
-    print(
-        "[MODEL] Config: "
-        f"block_size={config.block_size}, "
-        f"vocab_size={config.vocab_size}, "
-        f"n_layer={config.n_layer}, "
-        f"n_head={config.n_head}, "
-        f"n_embd={config.n_embd}"
-    )
+        return model, tokenizer
 
 
-    model = GPT(
-        config
-    )
-
-    if "model" in checkpoint:
-
-        state_dict = checkpoint[
-            "model"
-        ]
-
-    elif "state_dict" in checkpoint:
-
-        state_dict = checkpoint[
-            "state_dict"
-        ]
-
-    else:
-
-        raise RuntimeError(
-            f"Checkpoint for '{model_name}' "
-            "does not contain model weights."
-        )
-
-
-    try:
-
-        model.load_state_dict(
-            state_dict,
-            strict=True
-        )
-
-    except RuntimeError as e:
-
-        raise RuntimeError(
-            f"Checkpoint architecture does not "
-            f"match the current GPT implementation "
-            f"for '{model_name}'.\n\n{e}"
-        ) from e
-
-
-    model = model.to(
-        DEVICE
-    )
-
-    if (
-        USE_HALF
-        and DEVICE.type == "cuda"
-    ):
-
-        model = model.half()
-
-    model.eval()
-
-    del checkpoint
-    del state_dict
-
-    if DEVICE.type == "cuda":
-
-        torch.cuda.empty_cache()
-
-    print(
-        f"[MODEL] {model_name} loaded on "
-        f"{DEVICE}"
-    )
-
+def get_model(model_name: str):
+    model, _ = load_model(model_name)
     return model
 
 
+def get_tokenizer(model_name: str):
+    _, tokenizer = load_model(model_name)
+    return tokenizer
 
-def get_model(
-    model_name: str
+
+def list_models():
+    return list(MODELS.keys())
+
+
+def is_model_available(model_name: str):
+    return model_name in MODELS
+
+
+# ============================================================
+# Generation helpers
+# ============================================================
+
+def _build_generation_kwargs(
+    tokenizer,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int | None,
+    repetition_penalty: float,
+    frequency_penalty: float,
+    presence_penalty: float,
+    seed: int | None,
+    stop: list[str] | None,
 ):
 
-    if not is_model_available(
-        model_name
-    ):
+    do_sample = temperature > 0
 
-        raise ValueError(
-            f"Unknown model: {model_name}. "
-            f"Available models: "
-            f"{list_models()}"
-        )
+    kwargs = {
+        "max_new_tokens": max_tokens,
+        "use_cache": True,
+        "do_sample": do_sample,
+        "eos_token_id": tokenizer.eos_token_id,
+        "pad_token_id": tokenizer.eos_token_id,
+        "repetition_penalty": repetition_penalty,
+    }
+
+    if do_sample:
+        kwargs["temperature"] = temperature
+        kwargs["top_p"] = top_p
+
+        if top_k is not None and top_k > 0:
+            kwargs["top_k"] = top_k
+
+    if frequency_penalty != 0 or presence_penalty != 0:
+
+        processors = LogitsProcessorList()
+
+        if frequency_penalty != 0:
+            processors.append(
+                FrequencyPenaltyLogitsProcessor(
+                    frequency_penalty
+                )
+            )
+
+        if presence_penalty != 0:
+            processors.append(
+                PresencePenaltyLogitsProcessor(
+                    presence_penalty
+                )
+            )
+
+        kwargs["logits_processor"] = processors
+
+    if stop:
+        kwargs["stop_strings"] = stop
+        kwargs["tokenizer"] = tokenizer
+
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    return kwargs
 
 
-    if model_name in model_cache:
+def _prepare_inputs(
+    tokenizer,
+    message: str,
+):
 
-        return model_cache[
-            model_name
-        ]
+    inputs = tokenizer(
+        message,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
 
-
-    with _model_lock:
-
-        # Another request may have loaded it
-        # while this thread was waiting.
-
-        if model_name in model_cache:
-
-            return model_cache[
-                model_name
-            ]
-
-        print(
-            f"[MODEL] Initialising "
-            f"{model_name}..."
-        )
-
-        model = load_model(
-            model_name
-        )
-
-        model_cache[
-            model_name
-        ] = model
-
-        return model
+    return {
+        key: value.to(DEVICE)
+        for key, value in inputs.items()
+    }
 
 
-def generate_response(
+def _validate_context_length(
     model,
+    prompt_tokens: int,
+    max_tokens: int,
+):
+
+    config = model.config
+
+    block_size = getattr(
+        config,
+        "max_position_embeddings",
+        getattr(config, "block_size", None),
+    )
+
+    if block_size is None:
+        return
+
+    if prompt_tokens >= block_size:
+        raise ValueError(
+            f"Input is too long. "
+            f"Maximum context length is {block_size} tokens."
+        )
+
+    available_tokens = block_size - prompt_tokens
+
+    if max_tokens > available_tokens:
+        raise ValueError(
+            f"max_tokens is too large for this prompt. "
+            f"Prompt uses {prompt_tokens} tokens and the model "
+            f"has a maximum context of {block_size} tokens, "
+            f"leaving {available_tokens} tokens available."
+        )
+
+
+# ============================================================
+# Non-streaming generation
+# ============================================================
+
+@torch.inference_mode()
+def generate_response(
+    model_name: str,
     message: str,
     max_tokens: int = 256,
     temperature: float = 0.7,
-    top_k: int = 40,
+    top_p: float = 1.0,
+    top_k: int | None = 40,
+    repetition_penalty: float = 1.0,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    seed: int | None = None,
+    stop: list[str] | None = None,
 ):
 
-    tokenizer = get_tokenizer()
+    model, tokenizer = load_model(model_name)
 
-    input_ids = tokenizer.encode(
+    inputs = _prepare_inputs(
+        tokenizer,
         message,
-        return_tensors="pt"
     )
 
-    input_ids = input_ids.to(
-        DEVICE
+    input_ids = inputs["input_ids"]
+
+    prompt_tokens = input_ids.shape[1]
+
+    _validate_context_length(
+        model,
+        prompt_tokens,
+        max_tokens,
     )
 
-    input_length = (
-        input_ids.shape[1]
+    generation_kwargs = _build_generation_kwargs(
+        tokenizer=tokenizer,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        seed=seed,
+        stop=stop,
     )
 
-
-    with torch.inference_mode():
-
-        output_ids = model.generate(
-            input_ids,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        )
-
-
-    generated_ids = (
-        output_ids[
-            :,
-            input_length:
-        ]
+    output = model.generate(
+        **inputs,
+        **generation_kwargs,
     )
 
-    response = tokenizer.decode(
-        generated_ids[0].tolist(),
-        skip_special_tokens=True
+    generated_ids = output[
+        0,
+        prompt_tokens:
+    ]
+
+    completion_tokens = generated_ids.shape[0]
+
+    text = tokenizer.decode(
+        generated_ids,
+        skip_special_tokens=True,
     )
 
-    return response.strip()
+    return {
+        "text": text,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": (
+                prompt_tokens +
+                completion_tokens
+            ),
+        },
+    }
+
+
+# ============================================================
+# Streaming generation
+# ============================================================
 
 def generate_response_stream(
-    model,
+    model_name: str,
     message: str,
     max_tokens: int = 256,
     temperature: float = 0.7,
-    top_k: int = 40,
+    top_p: float = 1.0,
+    top_k: int | None = 40,
+    repetition_penalty: float = 1.0,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    seed: int | None = None,
+    stop: list[str] | None = None,
 ):
-    tokenizer = get_tokenizer()
 
-    input_ids = tokenizer.encode(
+    model, tokenizer = load_model(model_name)
+
+    inputs = _prepare_inputs(
+        tokenizer,
         message,
-        return_tensors="pt"
-    ).to(DEVICE)
+    )
 
-    generated_ids = []
+    prompt_tokens = inputs["input_ids"].shape[1]
 
-    previous_text = ""
+    _validate_context_length(
+        model,
+        prompt_tokens,
+        max_tokens,
+    )
 
-    for token_id in model.generate_stream(
-        input_ids,
-        max_new_tokens=max_tokens,
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+        timeout=300.0,
+    )
+
+    generation_kwargs = _build_generation_kwargs(
+        tokenizer=tokenizer,
+        max_tokens=max_tokens,
         temperature=temperature,
+        top_p=top_p,
         top_k=top_k,
-    ):
-        generated_ids.append(token_id)
+        repetition_penalty=repetition_penalty,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        seed=seed,
+        stop=stop,
+    )
 
-        current_text = tokenizer.decode(
-            generated_ids,
-            skip_special_tokens=True
-        )
+    generation_kwargs["streamer"] = streamer
 
-        new_text = current_text[
-            len(previous_text):
-        ]
+    result = {}
 
-        previous_text = current_text
+    def generate():
 
-        if new_text:
-            yield new_text
+        try:
+
+            with torch.inference_mode():
+
+                result["output"] = model.generate(
+                    **inputs,
+                    **generation_kwargs,
+                )
+
+        except Exception as e:
+
+            result["error"] = e
+
+            # Force the streamer to finish so that
+            # the consuming request does not hang.
+            streamer.end()
+
+    thread = threading.Thread(
+        target=generate,
+        daemon=True,
+    )
+
+    thread.start()
+
+    for text in streamer:
+        yield text
+
+    thread.join()
+
+    if "error" in result:
+        raise result["error"]
