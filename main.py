@@ -20,12 +20,12 @@ class MessageRequest(BaseModel):
     model_name: str = "Gruyere-1.1"
     message: str
 
-    max_tokens: int = 100
+    max_tokens: int = 256
     temperature: float = 0.7
-    top_p: float = 1.0
-    top_k: int = 40
+    top_p: float = 0.9
+    top_k: int = 30
 
-    repetition_penalty: float = 1.0
+    repetition_penalty: float = 1.2
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
 

@@ -16,7 +16,7 @@ from transformers import (
 
 MODELS = {
     "Gruyere-1.1": "Erbium08/Gruyere-1.1",
-    # "Gruyere-1.2": "Erbium08/Gruyere-1.2",
+    "Gruyere-1.2": "Erbium08/Gruyere-1.2",
     # "Ricotta-1.0": "Erbium08/Ricotta-1.0",
 }
 
