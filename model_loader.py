@@ -7,6 +7,9 @@ MODELS = {
     "Gruyere-1.1": "Erbium08/Gruyere-1.1",
     "Gruyere-1.2": "Erbium08/Gruyere-1.2",
     "Ricotta-2.0-Instruct": "GoudaAI/Ricotta-2.0-Instruct"
+    "Gruyere-2.0-Instruct": "GoudaAI/Gruyere-2.0-Instruct"
+    "Gouda-2.0-Instruct": "GoudaAI/Gouda-2.0-Instruct"
+    "Cheddar-2.0-Instruct": "GoudaAI/Cheddar-2.0-Instruct"
 }
 
 DEVICE = torch.device("cpu")
