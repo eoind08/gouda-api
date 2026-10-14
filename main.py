@@ -21,12 +21,12 @@ class MessageRequest(BaseModel):
     message: str
 
     max_tokens: int = 256
-    temperature: float = 0.7
+    temperature: float = 0.6
     top_p: float = 0.9
     top_k: int = 30
 
-    repetition_penalty: float = 1.2
-    frequency_penalty: float = 0.0
+    repetition_penalty: float = 1.12
+    frequency_penalty: float = 0.1
     presence_penalty: float = 0.0
 
     seed: int | None = None
